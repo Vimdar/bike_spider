@@ -8,6 +8,9 @@ from bricolage.items import VeloItem
 from scrapy import selector
 import re
 from lxml.html import fromstring as fs
+import requests
+import json
+from scrapy.utils.project import get_project_settings
 
 
 class BikeSpider(Spider):
@@ -17,6 +20,7 @@ class BikeSpider(Spider):
         kwargs = {k: v for k, v in kwargs.items()}
         self.logger.info(u'Spider arguments:\n{}'.format(pp.pformat(kwargs)))
         Spider.__init__(self, **kwargs)
+        self.settings = get_project_settings()
 
         self.start_urls = kwargs['start_urls'].split(';')
         if 'allowed_domains' in kwargs and kwargs['allowed_domains'] is not None:
@@ -48,6 +52,8 @@ class BikeSpider(Spider):
                 )
         crawl_date = dt.now()
         links = response.xpath(self.item_xpath).extract()
+        csrf_token = self.get_csrf_token(response)
+        jsession_id = response.headers.getlist('Set-Cookie')[0].decode('utf-8').split(';')[0]
         for link in links:
             inner = fs(link)
             url = response.urljoin(inner.xpath('//a/@href')[0])
@@ -57,7 +63,9 @@ class BikeSpider(Spider):
                 'link': url,
                 'crawl_date': crawl_date,
                 'img': img,
-                'title': title
+                'title': title,
+                'csrf_token': csrf_token,
+                'jsession_id': jsession_id,
             }
             yield Request(
                 url,
@@ -66,6 +74,7 @@ class BikeSpider(Spider):
             )
 
     def parse_item(self, response):
+        numb = response.url.split('/')[-1]
         item = VeloItem(
             url=response.url,
             crawl_date=response.meta['crawl_date'],
@@ -79,8 +88,43 @@ class BikeSpider(Spider):
             item['image_url'] = ''.join(hxs.xpath(self.img_xpath).extract())
         if not item['title']:
             item['title'] = ''.join(hxs.xpath(self.title_xpath).extract())
+        store_data = self.get_store_supply_data(numb,
+                                                response.meta['jsession_id'],
+                                                response.url,
+                                                response.meta['csrf_token'],
+                                                )
+        item['stores'] = store_data
         yield item
 
     def get_decimal_price(self, price):
         return re.findall(self.price_regex, price)[0]
-# scrapy crawl bike_spider -a start_urls='https://mr-bricolage.bg/bg/Instrumenti/Avto-i-veloaksesoari/Veloaksesoari/c/006008012?q=%3Arelevance&page=0&priceValue=' -a pagination_xpath="(//li[@class='pagination-next'])[1]/a" -a item_xpath="//div[@class='product']/div/a[not(@class)]" -a title_xpath="(//h1)[1]/text()" -a img_xpath="(//div[@class='owl-item active'])[1]/div/img/@src" -a price_xpath="//p[@class='price']/text()" -a description_xpath="//div[@id='profile']/div/p/text()"
+
+    def get_store_supply_data(self, numb, jsession_id, referer, csrf_token):
+        # WORKAROUND: simulating the ajax call to the API that the site makes
+        # to obtain the store supply data
+        # since it's resource cheaper than setting up and maintaining
+        # some rendering engine (splash, selenium, etc.)
+        # for this purpose we'll make a call to the API for every item we find
+        # -url contains the product id
+        # -headers will be enriched with the session cookie and referer to
+        # the item page
+        # request data has to contain csrf token set for our session
+        api_call_url = self.settings['STORE_API_URL'][0] + numb + self.settings['STORE_API_URL'][1]
+
+        headers = self.settings['API_HEADERS']
+        headers['Cookie'] = jsession_id + '; ' + self.settings['SESSION_VARS'][0] \
+            + ' ' + jsession_id + '; ' + self.settings['SESSION_VARS'][1]
+        headers['Referer'] = referer
+
+        api_data_call = self.settings['API_DATA'] + csrf_token
+
+        req = requests.post(url=api_call_url, headers=headers, data=api_data_call)
+        try:
+            json_data = json.loads(req.content)
+            store_data = json_data['data']
+        except ValueError:  # JSONDecodeError inherits from ValueError
+            return 'Error while getting store_data'
+        return store_data
+
+    def get_csrf_token(self, response):
+        return response.xpath("//input[@name='CSRFToken']/@value").extract()[0]

@@ -10,3 +10,4 @@ class VeloItem(Item):
     image_url = Field()
     price = Field()
     description = Field()
+    stores = Field()
